@@ -1,0 +1,241 @@
+//@version=5
+indicator("HH-LL Buy/Sell + EMA — FIXED", shorttitle="HHLL Fixed", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ============================================================================
+// PURPOSE
+// - Keeps the original ATR-reversal ZigZag + HH/HL/LH/LL concept.
+// - FIX 1: signals are emitted on the CONFIRMATION bar, never backdated.
+// - FIX 2: only one signal per regime; no repeated/fakeout sells.
+// - FIX 3: an LL during an up-regime starts a down-regime; it is NOT a buy.
+// - FIX 4: ATR threshold is frozen for each ZigZag leg, so it cannot shrink/
+//           expand while the extreme is being hunted.
+// - FIX 5: signals are bar-close confirmed to prevent intrabar flicker/repaint.
+// ============================================================================
+
+grpZZ = "ZigZag"
+zigzagPeriod = input.int(4, "ZigZag Period (ATR length)", minval=1, group=grpZZ)
+revMultiplier = input.float(1.0, "Reversal Sensitivity (x ATR)", minval=0.1, step=0.1, group=grpZZ)
+showZigzag = input.bool(true, "Show ZigZag", group=grpZZ)
+showSR = input.bool(true, "Show Support/Resistance", group=grpZZ)
+changeBarColor = input.bool(true, "Change Bar Color if S/R Broken", group=grpZZ)
+
+grpLabels = "HH/HL/LH/LL Structure"
+showHH = input.bool(false, "Show HH", group=grpLabels)
+showLH = input.bool(false, "Show LH", group=grpLabels)
+showHL = input.bool(false, "Show HL", group=grpLabels)
+showLL = input.bool(false, "Show LL", group=grpLabels)
+
+grpSig = "Buy / Sell Signals"
+showSignals = input.bool(true, "Show Buy/Sell Signals", group=grpSig)
+signalStyle = input.string("Label", "Signal Style", options=["Arrow", "Letter (B/S)", "Label"], group=grpSig)
+sigOffsetMult = input.float(0.35, "Signal Distance (x ATR)", minval=0.0, step=0.05, group=grpSig)
+confirmOnClose = input.bool(true, "Confirm Signals On Bar Close", group=grpSig,
+     tooltip="Recommended for paper/live trading. Prevents intrabar signal flicker.")
+
+grpEMA = "Moving Averages"
+showEMA50 = input.bool(true, "Show EMA 50", group=grpEMA)
+showEMA200 = input.bool(true, "Show EMA 200", group=grpEMA)
+emaFastLen = input.int(50, "EMA Fast Length", minval=1, group=grpEMA)
+emaSlowLen = input.int(200, "EMA Slow Length", minval=1, group=grpEMA)
+
+upColor = color.new(#26a69a, 0)
+downColor = color.new(#ef5350, 0)
+
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+plot(showEMA50 ? emaFast : na, "EMA 50", color=color.blue, linewidth=2)
+plot(showEMA200 ? emaSlow : na, "EMA 200", color=color.rgb(30, 30, 47), linewidth=2)
+
+atrVal = ta.atr(zigzagPeriod)
+
+// ------------------------- STATE --------------------------------------------
+var string searchDir = "high"
+var float extremeVal = na
+var int extremeBar = na
+var float legAtr = na
+
+var float lastPivotHighVal = na
+var float lastPivotLowVal = na
+
+var string trendDir = "none"      // up / down / none
+var float pendingLLVal = na
+var int pendingLLBar = na
+var float pendingHHVal = na
+var int pendingHHBar = na
+
+var line resLine = na
+var line supLine = na
+var float zzLastVal = na
+var int zzLastBar = na
+
+buyTriggered = false
+sellTriggered = false
+
+labelOffset = atrVal * sigOffsetMult
+buyText = signalStyle == "Arrow" ? "▲" : signalStyle == "Letter (B/S)" ? "B" : "Buy"
+sellText = signalStyle == "Arrow" ? "▼" : signalStyle == "Letter (B/S)" ? "S" : "Sell"
+sigLabelSize = signalStyle == "Label" ? size.normal : size.small
+
+if barstate.isfirst and not na(atrVal)
+    extremeVal := high
+    extremeBar := bar_index
+    legAtr := atrVal
+
+// ======================= HIGH LEG ==========================================
+if searchDir == "high"
+    if na(extremeVal)
+        extremeVal := high
+        extremeBar := bar_index
+    if high > extremeVal
+        extremeVal := high
+        extremeBar := bar_index
+
+    reversalAmt = nz(legAtr, atrVal) * revMultiplier
+
+    if not na(extremeVal) and not na(reversalAmt) and low <= extremeVal - reversalAmt
+        pivotVal = extremeVal
+        pivotBarIdx = extremeBar
+        tag = na(lastPivotHighVal) ? "" : (pivotVal > lastPivotHighVal ? "HH" : "LH")
+
+        if showHH and tag == "HH"
+            label.new(pivotBarIdx, pivotVal, "HH", xloc=xloc.bar_index, yloc=yloc.price,
+                 style=label.style_label_down, textcolor=color.white, color=upColor, size=size.small)
+        if showLH and tag == "LH"
+            label.new(pivotBarIdx, pivotVal, "LH", xloc=xloc.bar_index, yloc=yloc.price,
+                 style=label.style_label_down, textcolor=color.white, color=downColor, size=size.small)
+
+        if showZigzag and not na(zzLastVal)
+            line.new(zzLastBar, zzLastVal, pivotBarIdx, pivotVal, xloc=xloc.bar_index,
+                 color=tag == "LH" ? downColor : upColor, width=2)
+        zzLastVal := pivotVal
+        zzLastBar := pivotBarIdx
+
+        if showSR
+            if not na(resLine)
+                line.delete(resLine)
+            resLine := line.new(pivotBarIdx, pivotVal, bar_index, pivotVal, xloc=xloc.bar_index,
+                 color=downColor, style=line.style_dashed, width=1, extend=extend.right)
+
+        // ---------------- SIGNAL STATE MACHINE: HIGH SIDE -------------------
+        // SELL = first confirmed LH after an up/neutral regime.
+        // HH inside down-regime is only a candidate reversal; wait for low-side
+        // confirmation. Never create a second sell during an already-down regime.
+        if tag == "LH"
+            if trendDir != "down"
+                if showSignals and (not confirmOnClose or barstate.isconfirmed)
+                    label.new(bar_index, high + labelOffset, sellText, xloc=xloc.bar_index,
+                         yloc=yloc.price, style=label.style_label_down,
+                         color=downColor, textcolor=color.white, size=sigLabelSize)
+                    sellTriggered := true
+                trendDir := "down"
+                pendingLLVal := na
+                pendingLLBar := na
+                pendingHHVal := na
+                pendingHHBar := na
+        else if tag == "HH"
+            if trendDir == "down"
+                pendingHHVal := pivotVal
+                pendingHHBar := pivotBarIdx
+            else
+                trendDir := "up"
+
+        lastPivotHighVal := pivotVal
+        searchDir := "low"
+        extremeVal := low
+        extremeBar := bar_index
+        legAtr := atrVal
+
+// ======================== LOW LEG ==========================================
+else
+    if na(extremeVal)
+        extremeVal := low
+        extremeBar := bar_index
+    if low < extremeVal
+        extremeVal := low
+        extremeBar := bar_index
+
+    reversalAmt = nz(legAtr, atrVal) * revMultiplier
+
+    if not na(extremeVal) and not na(reversalAmt) and high >= extremeVal + reversalAmt
+        pivotVal = extremeVal
+        pivotBarIdx = extremeBar
+        tag = na(lastPivotLowVal) ? "" : (pivotVal > lastPivotLowVal ? "HL" : "LL")
+
+        if showHL and tag == "HL"
+            label.new(pivotBarIdx, pivotVal, "HL", xloc=xloc.bar_index, yloc=yloc.price,
+                 style=label.style_label_up, textcolor=color.white, color=upColor, size=size.small)
+        if showLL and tag == "LL"
+            label.new(pivotBarIdx, pivotVal, "LL", xloc=xloc.bar_index, yloc=yloc.price,
+                 style=label.style_label_up, textcolor=color.white, color=downColor, size=size.small)
+
+        if showZigzag and not na(zzLastVal)
+            line.new(zzLastBar, zzLastVal, pivotBarIdx, pivotVal, xloc=xloc.bar_index,
+                 color=tag == "HL" ? upColor : downColor, width=2)
+        zzLastVal := pivotVal
+        zzLastBar := pivotBarIdx
+
+        if showSR
+            if not na(supLine)
+                line.delete(supLine)
+            supLine := line.new(pivotBarIdx, pivotVal, bar_index, pivotVal, xloc=xloc.bar_index,
+                 color=upColor, style=line.style_dashed, width=1, extend=extend.right)
+
+        // ---------------- SIGNAL STATE MACHINE: LOW SIDE -------------------
+        if not na(pendingHHVal)
+            // HH occurred during a down-regime.
+            // HL = genuine reversal -> BUY NOW at confirmation bar.
+            // LL = fakeout -> remain down; DO NOT emit another SELL.
+            if tag == "HL"
+                if showSignals and (not confirmOnClose or barstate.isconfirmed)
+                    label.new(bar_index, low - labelOffset, buyText, xloc=xloc.bar_index,
+                         yloc=yloc.price, style=label.style_label_up,
+                         color=upColor, textcolor=color.white, size=sigLabelSize)
+                    buyTriggered := true
+                trendDir := "up"
+                pendingLLVal := na
+                pendingLLBar := na
+            else if tag == "LL"
+                pendingLLVal := pivotVal
+                pendingLLBar := pivotBarIdx
+                trendDir := "down"
+            pendingHHVal := na
+            pendingHHBar := na
+
+        else if tag == "LL"
+            // CRITICAL FIX:
+            // A lower-low during an up-regime is NOT a buy-the-dip signal.
+            // It starts/continues a down-regime and waits for an HL to reverse.
+            pendingLLVal := pivotVal
+            pendingLLBar := pivotBarIdx
+            trendDir := "down"
+
+        else if tag == "HL"
+            // Down-regime ends here.
+            // The signal is emitted NOW (confirmation bar), never at pendingLLBar.
+            if trendDir == "down" or trendDir == "none"
+                if showSignals and (not confirmOnClose or barstate.isconfirmed)
+                    label.new(bar_index, low - labelOffset, buyText, xloc=xloc.bar_index,
+                         yloc=yloc.price, style=label.style_label_up,
+                         color=upColor, textcolor=color.white, size=sigLabelSize)
+                    buyTriggered := true
+                trendDir := "up"
+                pendingLLVal := na
+                pendingLLBar := na
+
+        else if tag == "HH"
+            trendDir := "up"
+
+        lastPivotLowVal := pivotVal
+        searchDir := "high"
+        extremeVal := high
+        extremeBar := bar_index
+        legAtr := atrVal
+
+// ------------------------- S/R BAR COLOR -----------------------------------
+resBroken = changeBarColor and not na(lastPivotHighVal) and close > lastPivotHighVal
+supBroken = changeBarColor and not na(lastPivotLowVal) and close < lastPivotLowVal
+barcolor(changeBarColor ? (resBroken ? upColor : supBroken ? downColor : na) : na)
+
+// ------------------------- ALERTS -------------------------------------------
+alertcondition(buyTriggered, title="BUY — confirmed reversal", message="BUY — confirmed HH/HL/LL structure reversal")
+alertcondition(sellTriggered, title="SELL — confirmed reversal", message="SELL — confirmed LH structure break")
